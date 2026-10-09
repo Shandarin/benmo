@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "benmo-worker"
+version = "0.1.0"
+description = "Auditable research, document and verification workers for Benmo"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.35,<2",
+  "httpx>=0.27,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "pypdf>=5.1,<6",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=2.46,<3"]
+dev = [
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+benmo-worker = "benmo_worker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/benmo_worker"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["benmo_worker"]

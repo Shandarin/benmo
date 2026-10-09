@@ -1,0 +1,401 @@
+name: CI and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: ${{ matrix.name }} checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            directory: benmo-backend
+            extras: dev,aws
+          - name: worker
+            directory: benmo-worker
+            extras: dev,openai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ${{ matrix.directory }}/pyproject.toml
+      - name: Install ${{ matrix.name }}
+        working-directory: ${{ matrix.directory }}
+        run: python -m pip install -e ".[${{ matrix.extras }}]"
+      - name: Install worker contract peer for backend integration
+        if: matrix.name == 'backend'
+        run: python -m pip install -e "./benmo-worker[openai]"
+      - name: Ruff format
+        working-directory: ${{ matrix.directory }}
+        run: python -m ruff format --check .
+      - name: Ruff
+        working-directory: ${{ matrix.directory }}
+        run: python -m ruff check .
+      - name: Mypy
+        working-directory: ${{ matrix.directory }}
+        run: python -m mypy src
+      - name: Pytest
+        working-directory: ${{ matrix.directory }}
+        run: python -m pytest
+
+  containers:
+    name: Docker build (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: benmo-backend
+          - name: worker
+            context: benmo-worker
+          - name: frontend
+            context: benmo-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: false
+          tags: benmo-${{ matrix.name }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: benmo-frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: benmo-frontend
+        run: npm ci
+      - name: Install Playwright Chromium
+        working-directory: benmo-frontend
+        run: npx playwright install --with-deps chromium
+      - name: Lint frontend
+        working-directory: benmo-frontend
+        run: npm run lint
+      - name: Type-check frontend
+        working-directory: benmo-frontend
+        run: npm run typecheck
+      - name: Test frontend
+        working-directory: benmo-frontend
+        run: npm test
+      - name: Build frontend
+        if: github.event_name == 'pull_request'
+        working-directory: benmo-frontend
+        run: npm run build
+      - name: Test frontend journeys
+        working-directory: benmo-frontend
+        run: npm run test:e2e
+
+  infrastructure:
+    name: CDK check and synth
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+      - name: Install infrastructure dependencies
+        working-directory: infra
+        run: npm ci
+      - name: Type-check CDK
+        working-directory: infra
+        run: npm run check
+      - name: Synthesize CloudFormation
+        working-directory: infra
+        run: npm run synth
+
+  deploy:
+    name: Deploy production to AWS
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [python, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      API_ECR_REPOSITORY: benmo-backend
+      WORKER_ECR_REPOSITORY: benmo-worker
+      FRONTEND_ECR_REPOSITORY: benmo-frontend
+      ACM_CERTIFICATE_ARN: ${{ vars.ACM_CERTIFICATE_ARN }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS || '[]' }}
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+      SITE_URL: ${{ vars.SITE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install and validate CDK
+        working-directory: infra
+        run: |
+          npm ci
+          npm run check
+          npm run synth
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: benmo-production-deploy
+
+      - name: Validate deployment configuration
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY secret is required"; exit 1; }
+          test -n "$ACM_CERTIFICATE_ARN" || { echo "ACM_CERTIFICATE_ARN variable is required"; exit 1; }
+          test -n "$SEC_USER_AGENT" || { echo "SEC_USER_AGENT variable is required"; exit 1; }
+          test -n "$SITE_URL" || { echo "SITE_URL variable is required"; exit 1; }
+          [[ "$SITE_URL" =~ ^https://[^/]+$ ]] || {
+            echo "::error::SITE_URL must be an HTTPS origin without a path or trailing slash"
+            exit 1
+          }
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          echo "CDK_DEFAULT_ACCOUNT=$account_id" >> "$GITHUB_ENV"
+          echo "CDK_DEFAULT_REGION=$AWS_REGION" >> "$GITHUB_ENV"
+
+          certificate_status="$(aws acm describe-certificate \
+            --certificate-arn "$ACM_CERTIFICATE_ARN" \
+            --query "Certificate.Status" \
+            --output text)"
+          test "$certificate_status" = "ISSUED" || {
+            echo "::error::ACM certificate must be ISSUED; current status is $certificate_status"
+            exit 1
+          }
+
+          fargate_quota="$(aws service-quotas list-service-quotas \
+            --service-code fargate \
+            --query "Quotas[?QuotaName=='Fargate On-Demand vCPU resource count'].Value | [0]" \
+            --output text)"
+          test "$fargate_quota" != "None" || {
+            echo "::error::Unable to read the Fargate On-Demand vCPU quota"
+            exit 1
+          }
+          awk -v quota="$fargate_quota" 'BEGIN { exit !(quota >= 6) }' || {
+            echo "::error::Fargate On-Demand vCPU quota must be at least 6; current quota is $fargate_quota"
+            exit 1
+          }
+
+      - name: Ensure ECR repositories exist
+        run: |
+          for repository in \
+            "$API_ECR_REPOSITORY" \
+            "$WORKER_ECR_REPOSITORY" \
+            "$FRONTEND_ECR_REPOSITORY"; do
+            aws ecr describe-repositories --repository-names "$repository" >/dev/null 2>&1 ||
+              aws ecr create-repository \
+                --repository-name "$repository" \
+                --image-scanning-configuration scanOnPush=true \
+                --image-tag-mutability IMMUTABLE >/dev/null
+          done
+
+      - name: Update provider API keys
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+        run: |
+          jq -n \
+            --arg openai "$OPENAI_API_KEY" \
+            --arg finnhub "${FINNHUB_API_KEY:-replace-me}" \
+            --arg alphaVantage "${ALPHA_VANTAGE_API_KEY:-replace-me}" \
+            --arg fred "${FRED_API_KEY:-replace-me}" \
+            --arg bls "${BLS_API_KEY:-replace-me}" \
+            --arg eia "${EIA_API_KEY:-replace-me}" \
+            --arg bea "${BEA_API_KEY:-replace-me}" \
+            '{
+              OPENAI_API_KEY: $openai,
+              FINNHUB_API_KEY: $finnhub,
+              ALPHA_VANTAGE_API_KEY: $alphaVantage,
+              FRED_API_KEY: $fred,
+              BLS_API_KEY: $bls,
+              EIA_API_KEY: $eia,
+              BEA_API_KEY: $bea
+            }' > provider-secret.json
+          if aws secretsmanager describe-secret \
+            --secret-id benmo-production/provider-credentials >/dev/null 2>&1; then
+            aws secretsmanager put-secret-value \
+              --secret-id benmo-production/provider-credentials \
+              --secret-string file://provider-secret.json >/dev/null
+          else
+            aws secretsmanager create-secret \
+              --name benmo-production/provider-credentials \
+              --description "Provider API keys managed by the Benmo deployment workflow" \
+              --secret-string file://provider-secret.json >/dev/null
+          fi
+          rm provider-secret.json
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push immutable images
+        id: images
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          api_image="$REGISTRY/$API_ECR_REPOSITORY:$GITHUB_SHA"
+          worker_image="$REGISTRY/$WORKER_ECR_REPOSITORY:$GITHUB_SHA"
+          frontend_image="$REGISTRY/$FRONTEND_ECR_REPOSITORY:$GITHUB_SHA"
+
+          if ! aws ecr describe-images \
+            --repository-name "$API_ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            docker build --tag "$api_image" benmo-backend
+            docker push "$api_image"
+          fi
+          if ! aws ecr describe-images \
+            --repository-name "$WORKER_ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            docker build --tag "$worker_image" benmo-worker
+            docker push "$worker_image"
+          fi
+          if ! aws ecr describe-images \
+            --repository-name "$FRONTEND_ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            docker build --build-arg SITE_URL="$SITE_URL" --tag "$frontend_image" benmo-frontend
+            docker push "$frontend_image"
+          fi
+
+          echo "api_uri=$api_image" >> "$GITHUB_OUTPUT"
+          echo "worker_uri=$worker_image" >> "$GITHUB_OUTPUT"
+          echo "frontend_uri=$frontend_image" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy application stack
+        working-directory: infra
+        env:
+          API_IMAGE_URI: ${{ steps.images.outputs.api_uri }}
+          WORKER_IMAGE_URI: ${{ steps.images.outputs.worker_uri }}
+          FRONTEND_IMAGE_URI: ${{ steps.images.outputs.frontend_uri }}
+        run: |
+          npx cdk deploy BenmoPlatformStack \
+            --require-approval never \
+            --outputs-file cdk-outputs.json \
+            --parameters CertificateArn="$ACM_CERTIFICATE_ARN" \
+            --parameters ApiImageUri="$API_IMAGE_URI" \
+            --parameters WorkerImageUri="$WORKER_IMAGE_URI" \
+            --parameters FrontendImageUri="$FRONTEND_IMAGE_URI" \
+            --parameters SiteUrl="$SITE_URL" \
+            --parameters CorsOrigins="$CORS_ORIGINS" \
+            --parameters SecUserAgent="$SEC_USER_AGENT"
+
+      - name: Validate public task networking
+        working-directory: infra
+        run: |
+          subnet_csv="$(jq -r '.BenmoPlatformStack.PublicSubnetIds' cdk-outputs.json)"
+          IFS=',' read -ra subnet_ids <<< "$subnet_csv"
+          test "${#subnet_ids[@]}" -ge 2 || {
+            echo "::error::At least two public task subnets are required"
+            exit 1
+          }
+
+          for subnet_id in "${subnet_ids[@]}"; do
+            route_table_id="$(aws ec2 describe-route-tables \
+              --filters "Name=association.subnet-id,Values=$subnet_id" \
+              --query 'RouteTables[0].RouteTableId' \
+              --output text)"
+            test "$route_table_id" != "None" || {
+              echo "::error::No route table is associated with $subnet_id"
+              exit 1
+            }
+            internet_route="$(aws ec2 describe-route-tables \
+              --route-table-ids "$route_table_id" \
+              --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && starts_with(GatewayId, 'igw-') && State=='active'] | length(@)" \
+              --output text)"
+            test "$internet_route" -ge 1 || {
+              echo "::error::Subnet $subnet_id has no active internet-gateway default route"
+              exit 1
+            }
+            available_ips="$(aws ec2 describe-subnets \
+              --subnet-ids "$subnet_id" \
+              --query 'Subnets[0].AvailableIpAddressCount' \
+              --output text)"
+            test "$available_ips" -ge 8 || {
+              echo "::error::Subnet $subnet_id has only $available_ips free IPv4 addresses"
+              exit 1
+            }
+          done
+
+      - name: Run database migration
+        working-directory: infra
+        run: |
+          cluster="$(jq -r '.BenmoPlatformStack.ClusterName' cdk-outputs.json)"
+          task_definition="$(jq -r '.BenmoPlatformStack.ApiTaskDefinitionArn' cdk-outputs.json)"
+          subnet_ids="$(jq -r '.BenmoPlatformStack.PublicSubnetIds' cdk-outputs.json)"
+          security_group_id="$(jq -r '.BenmoPlatformStack.ApiSecurityGroupId' cdk-outputs.json)"
+
+          task_arn="$(aws ecs run-task \
+            --cluster "$cluster" \
+            --launch-type FARGATE \
+            --task-definition "$task_definition" \
+            --network-configuration "awsvpcConfiguration={subnets=[$subnet_ids],securityGroups=[$security_group_id],assignPublicIp=ENABLED}" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["alembic","upgrade","head"]}]}' \
+            --started-by "github-actions-$GITHUB_RUN_ID" \
+            --query 'tasks[0].taskArn' \
+            --output text)"
+
+          test -n "$task_arn" && test "$task_arn" != "None"
+          aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn"
+          exit_code="$(aws ecs describe-tasks \
+            --cluster "$cluster" \
+            --tasks "$task_arn" \
+            --query "tasks[0].containers[?name=='api'].exitCode | [0]" \
+            --output text)"
+          test "$exit_code" = "0" || {
+            aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn"
+            exit 1
+          }
+
+      - name: Verify production health
+        working-directory: infra
+        run: |
+          alb_dns="$(jq -r '.BenmoPlatformStack.ApiLoadBalancerDnsName' cdk-outputs.json)"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --location --insecure \
+              "http://$alb_dns/health/ready" >/dev/null &&
+              curl --fail --silent --show-error --location --insecure \
+              "http://$alb_dns/healthz" >/dev/null; then
+              exit 0
+            fi
+            echo "Health check attempt $attempt/30 failed"
+            sleep 10
+          done
+          exit 1

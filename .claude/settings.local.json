@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude plugin *)",
+      "Bash(CLAUDECODE= CLAUDE_CODE_ENTRYPOINT= claude plugin marketplace add mattpocock/skills)",
+      "Bash(CLAUDECODE= CLAUDE_CODE_ENTRYPOINT= claude plugin list)",
+      "Read(//c/Users/47628/.claude/**)",
+      "Read(//c/Users/47628/.claude/plugins/**)",
+      "Bash(cd ~/.claude/plugins/cache/mattpocock/mattpocock-skills && find . -maxdepth 3 -type d | sort; echo \"=== commands ===\"; ls -la commands/ 2>/dev/null; echo \"=== skills ===\"; ls -la skills/ 2>/dev/null; echo \"=== grill ===\"; find . -iname '*grill*')",
+      "Bash(cd ~/.claude/plugins/cache/mattpocock/mattpocock-skills/1.2.0/skills/productivity/grilling && echo \"=== grilling SKILL.md ===\"; cat SKILL.md 2>/dev/null; echo; echo \"=== .claude-plugin manifest ===\"; cat ../../../.claude-plugin/plugin.json 2>/dev/null | head -60)",
+      "WebSearch",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)"
+    ]
+  }
+}

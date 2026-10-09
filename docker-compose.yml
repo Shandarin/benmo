@@ -1,0 +1,136 @@
+name: benmo
+
+x-worker-common: &worker-common
+  build:
+    context: ./benmo-worker
+  restart: unless-stopped
+  depends_on:
+    backend:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  environment: &worker-environment
+    BENMO_ENV: local
+    BENMO_PROVIDER_MODE: ${BENMO_PROVIDER_MODE:-stub}
+    BENMO_BACKEND_BASE_URL: http://backend:8000
+    BENMO_BACKEND_INTERNAL_TOKEN: ${BENMO_BACKEND_INTERNAL_TOKEN:-local-internal-token}
+    BENMO_OBJECT_STORE: s3
+    BENMO_S3_BUCKET: benmo-local-artifacts
+    BENMO_S3_PREFIX: benmo
+    BENMO_SQS_ENDPOINT_URL: http://localstack:4566
+    BENMO_RESEARCH_QUEUE_URL: http://localstack:4566/000000000000/analysis-requested
+    BENMO_DOCUMENT_QUEUE_URL: http://localstack:4566/000000000000/filing-processing
+    BENMO_DOCUMENT_QUEUE_URLS: http://localstack:4566/000000000000/source-fetch,http://localstack:4566/000000000000/filing-processing
+    BENMO_VERIFICATION_QUEUE_URL: http://localstack:4566/000000000000/indicator-verification
+    BENMO_MANUAL_REVIEW_QUEUE_URL: http://localstack:4566/000000000000/manual-review
+    AWS_REGION: us-east-1
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    BENMO_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    BENMO_OPENAI_MODEL: ${BENMO_OPENAI_MODEL:-gpt-5.6}
+    BENMO_FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+    BENMO_ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
+    BENMO_FRED_API_KEY: ${FRED_API_KEY:-}
+    BENMO_BLS_API_KEY: ${BLS_API_KEY:-}
+    BENMO_EIA_API_KEY: ${EIA_API_KEY:-}
+    BENMO_BEA_API_KEY: ${BEA_API_KEY:-}
+    BENMO_SEC_USER_AGENT: ${BENMO_SEC_USER_AGENT:-Benmo/0.1 local@example.invalid}
+  healthcheck:
+    test: ["CMD", "python", "-m", "benmo_worker", "doctor"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 20s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: benmo
+      POSTGRES_USER: benmo
+      POSTGRES_PASSWORD: benmo
+    ports:
+      - "${BENMO_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benmo -d benmo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4.6
+    restart: unless-stopped
+    environment:
+      SERVICES: s3,sqs
+      AWS_DEFAULT_REGION: us-east-1
+      DEBUG: ${LOCALSTACK_DEBUG:-0}
+      PERSISTENCE: "1"
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/10-init-aws.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"available\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./benmo-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    command:
+      - sh
+      - -ec
+      - alembic upgrade head && exec uvicorn benmo_backend.main:app --host 0.0.0.0 --port 8000
+    environment:
+      BENMO_ENVIRONMENT: local
+      BENMO_DATABASE_URL: postgresql+asyncpg://benmo:benmo@postgres:5432/benmo
+      BENMO_QUEUE_BACKEND: sqs
+      BENMO_AWS_REGION: us-east-1
+      BENMO_SQS_ANALYSIS_QUEUE_URL: http://localstack:4566/000000000000/analysis-requested
+      BENMO_BACKEND_INTERNAL_TOKEN: ${BENMO_BACKEND_INTERNAL_TOKEN:-local-internal-token}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL_SQS: http://localstack:4566
+      BENMO_ADMIN_API_KEY: ${BENMO_ADMIN_API_KEY:-local-admin-key-change-me}
+      BENMO_CORS_ORIGINS: '${BENMO_CORS_ORIGINS:-["http://localhost:3000"]}'
+      BENMO_LOG_LEVEL: ${BENMO_LOG_LEVEL:-INFO}
+    ports:
+      - "${BENMO_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  research-worker:
+    <<: *worker-common
+    command: ["consume", "--worker", "research"]
+
+  document-worker:
+    <<: *worker-common
+    command: ["consume", "--worker", "document"]
+
+  verification-worker:
+    <<: *worker-common
+    command: ["consume", "--worker", "verification"]
+
+volumes:
+  postgres_data:
+  localstack_data:
